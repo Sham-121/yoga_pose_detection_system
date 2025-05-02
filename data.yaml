@@ -1,0 +1,5 @@
+train: D:/yoga_pose_detection/output/train/images
+val: D:/yoga_pose_detection/output/val/images
+
+nc: 5
+names: ['downdog', 'goddess', 'plank', 'tree', 'warrior2']
