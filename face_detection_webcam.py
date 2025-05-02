@@ -3,13 +3,17 @@ import numpy as np
 import mediapipe as mp
 from ultralytics import YOLO
 import time
+import csv
+from datetime import datetime
+import os
+import winsound  # Works on Windows. For Linux/Mac, use `os.system("play beep.wav")` or similar.
 
 # === Setup ===
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
-model = YOLO("runs/yoga_pose_detection/weights/best.pt")  # Your trained YOLOv10 detection model
+model = YOLO("runs/yoga_pose_detection/weights/best.pt")  # Update to your model path
 
-# === Angle Calculation ===
+# === Calculate Angle ===
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
     radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
@@ -25,44 +29,71 @@ POSES = {
     "plank": {"left_elbow_angle": (160, 180), "left_knee_angle": (160, 180)}
 }
 
-# === Pose Matching ===
-def detect_pose(angles):
-    for pose, rules in POSES.items():
-        if all(j in angles and rules[j][0] <= angles[j] <= rules[j][1] for j in rules):
-            return pose
-    return "Wrong Pose"
+# === Pose Detection ===
+def detect_pose(angles, target_pose):
+    rules = POSES.get(target_pose, {})
+    match_count = 0
+    total = len(rules)
+    for joint, (min_angle, max_angle) in rules.items():
+        if joint in angles and min_angle <= angles[joint] <= max_angle:
+            match_count += 1
+    accuracy = (match_count / total) * 100 if total else 0
+    return accuracy
 
-# === Start Webcam ===
+# === CSV Logger ===
+def log_pose_result(pose, duration, accuracy):
+    file_path = "pose_results.csv"
+    file_exists = os.path.isfile(file_path)
+    with open(file_path, mode="a", newline="") as file:
+        writer = csv.writer(file)
+        if not file_exists:
+            writer.writerow(["Pose", "Timestamp", "Duration", "Accuracy (%)"])
+        writer.writerow([pose, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), f"{duration} seconds", f"{accuracy:.2f}%"])
+
+# === User Selection ===
+print("Available Poses:", list(POSES.keys()))
+selected_pose = input("Enter the pose you want to perform: ").strip().lower()
+
+if selected_pose not in POSES:
+    print("Invalid pose selected.")
+    exit()
+
+print(f"Now get ready to perform: {selected_pose}")
+
+# === Webcam Setup ===
 cap = cv2.VideoCapture(0)
-prev_time = time.time()
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)  # Set full resolution
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    hold_start_time = None
+    hold_duration = 10  # seconds
+    pose_held_successfully = False
+    final_accuracy = 0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
-            print("Failed to read from webcam.")
             break
 
+        frame = cv2.flip(frame, 1)
+        display_text = "Detecting..."
         results = model.predict(source=frame, conf=0.25, stream=True)
 
         for r in results:
-            print("YOLO boxes detected:", len(r.boxes))
             for box in r.boxes:
-                cls = int(box.cls[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                print(f"Box: ({x1}, {y1}) to ({x2}, {y2})")
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
 
-                # Extract crop
                 person_crop = frame[y1:y2, x1:x2]
                 if person_crop.shape[0] < 100 or person_crop.shape[1] < 100:
-                    print("Skipped small crop.")
                     continue
 
-                # MediaPipe
                 rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
                 result = pose.process(rgb)
                 angles = {}
-                status = "Unknown"
+                current_accuracy = 0
 
                 if result.pose_landmarks:
                     lm = result.pose_landmarks.landmark
@@ -80,50 +111,57 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                         ankle = get_point("LEFT_ANKLE")
                         rknee = get_point("RIGHT_KNEE")
 
-                        # Compute Angles
                         angles = {
                             "left_elbow_angle": calculate_angle(shoulder, elbow, wrist),
                             "left_knee_angle": calculate_angle(hip, knee, ankle),
                             "left_hip_angle": calculate_angle(shoulder, hip, knee),
                             "right_knee_angle": calculate_angle(hip, rknee, ankle)
                         }
-                        print("Angles:", angles)
 
-                        # Detect Pose
-                        status = detect_pose(angles)
-                        print("Detected Pose:", status)
+                        current_accuracy = detect_pose(angles, selected_pose)
 
-                        # Draw keypoints
                         mp_drawing.draw_landmarks(person_crop, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-                        # Display Angles
-                        y_offset = 20
-                        for k, v in angles.items():
-                            cv2.putText(person_crop, f"{k}: {int(v)}", (10, y_offset),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                            y_offset += 15
-
                     except Exception as e:
-                        print("Angle calculation error:", e)
+                        print("Pose detection error:", e)
 
-                # Draw Bounding Box
-                color = (0, 255, 0) if status != "Wrong Pose" else (0, 0, 255)
+                # Timer & Accuracy logic
+                if current_accuracy >= 90:
+                    if hold_start_time is None:
+                        hold_start_time = time.time()
+                    else:
+                        elapsed = time.time() - hold_start_time
+                        remaining = hold_duration - int(elapsed)
+                        if elapsed >= hold_duration:
+                            final_accuracy = current_accuracy
+                            pose_held_successfully = True
+                        else:
+                            display_text = f"Holding '{selected_pose}'... {remaining}s left ({current_accuracy:.1f}%)"
+                else:
+                    hold_start_time = None
+                    display_text = f"❌ Re-hold '{selected_pose}' (Accuracy: {current_accuracy:.1f}%)"
+
+                # Draw bounding box and label
+                color = (0, 255, 0) if current_accuracy >= 90 else (0, 0, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, status, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                cv2.putText(frame, f"{selected_pose}", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-                # Paste back crop with drawings
-                resized_crop = cv2.resize(person_crop, (x2 - x1, y2 - y1))
-                frame[y1:y2, x1:x2] = resized_crop
+        if pose_held_successfully:
+            display_text = f"✅ Held '{selected_pose}' for {hold_duration}s with {final_accuracy:.1f}% accuracy"
+            winsound.Beep(1000, 500)  # Beep after success
+            log_pose_result(selected_pose, hold_duration, final_accuracy)
+            cv2.putText(frame, display_text, (30, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.imshow("Yoga Pose Timer", frame)
+            cv2.waitKey(2000)
+            break
 
-        # Show FPS
-        curr_time = time.time()
-        fps = 1 / (curr_time - prev_time)
-        prev_time = curr_time
-        cv2.putText(frame, f"FPS: {int(fps)}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        # Draw status text
+        cv2.putText(frame, display_text, (30, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
 
-        # Show Output
-        cv2.imshow("Yoga Pose Detection", frame)
+        cv2.imshow("Yoga Pose Timer", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
