@@ -5,80 +5,75 @@ from ultralytics import YOLO
 import time
 import csv
 from datetime import datetime
-import os
-import winsound  # Works on Windows. For Linux/Mac, use `os.system("play beep.wav")` or similar.
+import winsound
 
-# === Setup ===
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
-model = YOLO("runs/yoga_pose_detection/weights/best.pt")  # Update to your model path
+model = YOLO("runs/yoga_pose_detection/weights/best.pt")  # Update path as needed
 
-# === Calculate Angle ===
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180.0 else angle
 
-# === Pose Rules ===
+# === Define target pose angles and tolerance ===
 POSES = {
-    "downdog": {"left_hip_angle": (70, 110)},
-    "goddess": {"left_knee_angle": (80, 100)},
-    "tree": {"right_knee_angle": (40, 70), "left_hip_angle": (160, 180)},
-    "warrior2": {"left_knee_angle": (80, 100), "left_elbow_angle": (150, 180)},
-    "plank": {"left_elbow_angle": (160, 180), "left_knee_angle": (160, 180)}
+    "downdog": {"left_hip_angle": (90, 20)},
+    "goddess": {"left_knee_angle": (90, 15)},
+    "tree": {"right_knee_angle": (60, 15), "left_hip_angle": (170, 10)},
+    "warrior2": {"left_knee_angle": (90, 15), "left_elbow_angle": (165, 15)},
+    "plank": {"left_elbow_angle": (170, 10), "left_knee_angle": (170, 10)}
 }
 
-# === Pose Detection ===
-def detect_pose(angles, target_pose):
-    rules = POSES.get(target_pose, {})
-    match_count = 0
-    total = len(rules)
-    for joint, (min_angle, max_angle) in rules.items():
-        if joint in angles and min_angle <= angles[joint] <= max_angle:
-            match_count += 1
-    accuracy = (match_count / total) * 100 if total else 0
-    return accuracy
+def angle_accuracy(actual, target, tolerance):
+    diff = abs(actual - target)
+    return max(0, 100 - (diff / tolerance) * 100)
 
-# === CSV Logger ===
-def log_pose_result(pose, duration, accuracy):
-    file_path = "pose_results.csv"
-    file_exists = os.path.isfile(file_path)
-    with open(file_path, mode="a", newline="") as file:
-        writer = csv.writer(file)
-        if not file_exists:
+def calculate_pose_accuracy(angles, target_pose):
+    required = POSES[target_pose]
+    total_accuracy = 0
+    count = 0
+    for key, (target_angle, tol) in required.items():
+        if key in angles:
+            acc = angle_accuracy(angles[key], target_angle, tol)
+            total_accuracy += acc
+            count += 1
+    return total_accuracy / count if count > 0 else 0
+
+def log_pose_result(pose, duration, avg_accuracy):
+    with open("pose_results.csv", "a", newline="") as f:
+        writer = csv.writer(f)
+        if f.tell() == 0:
             writer.writerow(["Pose", "Timestamp", "Duration", "Accuracy (%)"])
-        writer.writerow([pose, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), f"{duration} seconds", f"{accuracy:.2f}%"])
+        writer.writerow([pose, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), f"{duration}s", f"{avg_accuracy:.2f}%"])
 
-# === User Selection ===
-print("Available Poses:", list(POSES.keys()))
-selected_pose = input("Enter the pose you want to perform: ").strip().lower()
-
+# === Select pose ===
+print("Available poses:", list(POSES.keys()))
+selected_pose = input("Enter pose to perform: ").strip().lower()
 if selected_pose not in POSES:
-    print("Invalid pose selected.")
+    print("Invalid pose.")
     exit()
 
-print(f"Now get ready to perform: {selected_pose}")
-
-# === Webcam Setup ===
+# === Webcam ===
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)  # Set full resolution
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+cap.set(3, 1280)
+cap.set(4, 720)
 
 with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-    hold_start_time = None
-    hold_duration = 10  # seconds
-    pose_held_successfully = False
-    final_accuracy = 0
+    hold_start = None
+    hold_duration = 3
+    pose_logged = False
+    accuracy_history = []
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
         frame = cv2.flip(frame, 1)
-        display_text = "Detecting..."
+
         results = model.predict(source=frame, conf=0.25, stream=True)
+        display_text = f"Pose: {selected_pose}"
 
         for r in results:
             for box in r.boxes:
@@ -86,30 +81,27 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
 
-                person_crop = frame[y1:y2, x1:x2]
-                if person_crop.shape[0] < 100 or person_crop.shape[1] < 100:
-                    continue
-
-                rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
+                person = frame[y1:y2, x1:x2]
+                rgb = cv2.cvtColor(person, cv2.COLOR_BGR2RGB)
                 result = pose.process(rgb)
                 angles = {}
-                current_accuracy = 0
+                accuracy = 0
 
                 if result.pose_landmarks:
                     lm = result.pose_landmarks.landmark
 
-                    def get_point(name):
-                        pt = lm[mp_pose.PoseLandmark[name].value]
-                        return int(pt.x * person_crop.shape[1]), int(pt.y * person_crop.shape[0])
+                    def get(name):
+                        p = lm[mp_pose.PoseLandmark[name].value]
+                        return int(p.x * person.shape[1]), int(p.y * person.shape[0])
 
                     try:
-                        shoulder = get_point("LEFT_SHOULDER")
-                        elbow = get_point("LEFT_ELBOW")
-                        wrist = get_point("LEFT_WRIST")
-                        hip = get_point("LEFT_HIP")
-                        knee = get_point("LEFT_KNEE")
-                        ankle = get_point("LEFT_ANKLE")
-                        rknee = get_point("RIGHT_KNEE")
+                        shoulder = get("LEFT_SHOULDER")
+                        elbow = get("LEFT_ELBOW")
+                        wrist = get("LEFT_WRIST")
+                        hip = get("LEFT_HIP")
+                        knee = get("LEFT_KNEE")
+                        ankle = get("LEFT_ANKLE")
+                        rknee = get("RIGHT_KNEE")
 
                         angles = {
                             "left_elbow_angle": calculate_angle(shoulder, elbow, wrist),
@@ -118,50 +110,41 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
                             "right_knee_angle": calculate_angle(hip, rknee, ankle)
                         }
 
-                        current_accuracy = detect_pose(angles, selected_pose)
-
-                        mp_drawing.draw_landmarks(person_crop, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                        accuracy = calculate_pose_accuracy(angles, selected_pose)
+                        mp_drawing.draw_landmarks(person, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
                     except Exception as e:
-                        print("Pose detection error:", e)
+                        print("Error:", e)
 
-                # Timer & Accuracy logic
-                if current_accuracy >= 90:
-                    if hold_start_time is None:
-                        hold_start_time = time.time()
+                if accuracy >= 70:  # Allow some flexibility in hold accuracy
+                    if hold_start is None:
+                        hold_start = time.time()
+                        accuracy_history = []
+                    accuracy_history.append(accuracy)
+                    elapsed = time.time() - hold_start
+                    if elapsed >= hold_duration and not pose_logged:
+                        avg_accuracy = sum(accuracy_history) / len(accuracy_history)
+                        display_text = f"✅ Held! Final Accuracy: {avg_accuracy:.1f}%"
+                        log_pose_result(selected_pose, hold_duration, avg_accuracy)
+                        winsound.Beep(1000, 500)
+                        pose_logged = True
                     else:
-                        elapsed = time.time() - hold_start_time
-                        remaining = hold_duration - int(elapsed)
-                        if elapsed >= hold_duration:
-                            final_accuracy = current_accuracy
-                            pose_held_successfully = True
-                        else:
-                            display_text = f"Holding '{selected_pose}'... {remaining}s left ({current_accuracy:.1f}%)"
+                        remaining = int(hold_duration - elapsed)
+                        display_text = f"Holding... {remaining}s"
                 else:
-                    hold_start_time = None
-                    display_text = f"❌ Re-hold '{selected_pose}' (Accuracy: {current_accuracy:.1f}%)"
+                    hold_start = None
+                    accuracy_history = []
+                    display_text = f"Accuracy: {accuracy:.1f}%"  # Show live deviation-based accuracy
 
-                # Draw bounding box and label
-                color = (0, 255, 0) if current_accuracy >= 90 else (0, 0, 255)
+                color = (0, 255, 0) if accuracy >= 70 else (0, 0, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f"{selected_pose}", (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                cv2.putText(frame, selected_pose, (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        if pose_held_successfully:
-            display_text = f"✅ Held '{selected_pose}' for {hold_duration}s with {final_accuracy:.1f}% accuracy"
-            winsound.Beep(1000, 500)  # Beep after success
-            log_pose_result(selected_pose, hold_duration, final_accuracy)
-            cv2.putText(frame, display_text, (30, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.imshow("Yoga Pose Timer", frame)
-            cv2.waitKey(2000)
-            break
-
-        # Draw status text
         cv2.putText(frame, display_text, (30, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+        cv2.imshow("Yoga Pose Accuracy", frame)
 
-        cv2.imshow("Yoga Pose Timer", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
