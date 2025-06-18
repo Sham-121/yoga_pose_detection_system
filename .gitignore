@@ -1,0 +1,6 @@
+#Ignore the dataset folder
+/dataset
+#Ignore the folder that contains our model
+/run
+#Ignore per-processed image dataset folder
+/output
